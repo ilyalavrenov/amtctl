@@ -1,17 +1,14 @@
 package amt
 
 import (
+	"context"
 	"fmt"
+	"net"
+	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
-
-	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman"
-	amtboot "github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/amt/boot"
-	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/amt/messagelog"
-	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/amt/setupandconfiguration"
-	cimboot "github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/cim/boot"
-	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/cim/power"
-	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/client"
 )
 
 // bootConfig0 is the instance AMT reserves for one-time boot overrides.
@@ -20,9 +17,27 @@ const bootConfig0 = "Intel(r) AMT: Boot Configuration 0"
 // isNextSingleUse is the CIM_BootService role for a single boot.
 const isNextSingleUse = 1
 
+// amtFirmware is the CIM_SoftwareIdentity instance carrying the AMT version.
 const amtFirmware = "AMT"
 
-const requestTimeout = 30 * time.Second
+// Source is a CIM_BootSourceSetting instance ID.
+type Source string
+
+const (
+	pxe       Source = "Intel(r) AMT: Force PXE Boot"
+	hardDrive Source = "Intel(r) AMT: Force Hard-drive Boot"
+	cd        Source = "Intel(r) AMT: Force CD/DVD Boot"
+)
+
+// PowerState is a CIM_PowerManagementService power transition.
+type PowerState int
+
+const (
+	powerOn           PowerState = 2
+	powerCycleOffHard PowerState = 5
+	powerOffHard      PowerState = 8
+	masterBusReset    PowerState = 10
+)
 
 func StateNames() []string {
 	return []string{"on", "off", "reset", "cycle"}
@@ -32,79 +47,85 @@ func DeviceNames() []string {
 	return []string{"pxe", "hdd", "cd"}
 }
 
-func ParseDevice(name string) (cimboot.Source, error) {
+func ParseDevice(name string) (Source, error) {
 	switch name {
 	case "pxe":
-		return cimboot.PXE, nil
+		return pxe, nil
 	case "hdd":
-		return cimboot.HardDrive, nil
+		return hardDrive, nil
 	case "cd":
-		return cimboot.CD, nil
+		return cd, nil
 	default:
 		return "", fmt.Errorf("unknown boot device %q, want %s", name, strings.Join(DeviceNames(), "|"))
 	}
 }
 
-func ParseState(name string) (power.PowerState, error) {
+func ParseState(name string) (PowerState, error) {
 	switch name {
 	case "on":
-		return power.PowerOn, nil
+		return powerOn, nil
 	case "off":
-		return power.PowerOffHard, nil
+		return powerOffHard, nil
 	case "reset":
-		return power.MasterBusReset, nil
+		return masterBusReset, nil
 	case "cycle":
-		return power.PowerCycleOffHard, nil
+		return powerCycleOffHard, nil
 	default:
 		return 0, fmt.Errorf("unknown power state %q, want %s", name, strings.Join(StateNames(), "|"))
 	}
 }
 
 type Client struct {
-	messages wsman.Messages
+	endpoint  string
+	http      *http.Client
+	messageID atomic.Uint64
 }
 
 // New builds a client; useTLS selects port 16993 over 16992.
 func New(host, user, pass string, useTLS bool) *Client {
-	return &Client{messages: wsman.NewMessages(parameters(host, user, pass, useTLS))}
-}
-
-// Split from New so tests can inject a Transport; the library hardcodes the port.
-func parameters(host, user, pass string, useTLS bool) client.Parameters {
-	return client.Parameters{
-		Target:            host,
-		Username:          user,
-		Password:          pass,
-		UseDigest:         true,
-		UseTLS:            useTLS,
-		SelfSignedAllowed: true,
-		// The library makes its own context per request, so caller cancellation
-		// cannot reach the HTTP call.
-		Timeout: requestTimeout,
+	scheme, port := "http", "16992"
+	if useTLS {
+		scheme, port = "https", "16993"
 	}
+
+	return newClient(scheme+"://"+net.JoinHostPort(host, port)+"/wsman", user, pass)
 }
 
 // ChangePower errors if AMT accepted the request but refused the transition.
-func (c *Client) ChangePower(state power.PowerState) error {
-	res, err := c.messages.CIM.PowerManagementService.RequestPowerStateChange(state)
-	if err != nil {
+func (c *Client) ChangePower(ctx context.Context, state PowerState) error {
+	// AMT exposes one managed system, under a fixed name.
+	managed := reference(computerSystemResource,
+		selector{Name: "CreationClassName", Value: "CIM_ComputerSystem"},
+		selector{Name: "Name", Value: "ManagedSystem"},
+	)
+
+	body := requestPowerStateChangeInput{
+		H:              powerServiceResource,
+		PowerState:     state,
+		ManagedElement: managed,
+	}
+
+	var res powerChangeResponse
+
+	if err := c.post(ctx, powerServiceResource+"/RequestPowerStateChange", powerServiceResource, body, &res); err != nil {
 		return fmt.Errorf("request power state change: %w", err)
 	}
 
-	if rv := res.Body.RequestPowerStateChangeResponse.ReturnValue; rv != 0 {
-		return fmt.Errorf("power state change rejected: %s", rv)
+	if rv := res.ReturnValue; rv != 0 {
+		return fmt.Errorf("power state change rejected: %s", returnValueName(rv))
 	}
 
 	return nil
 }
 
-func (c *Client) FetchPowerState() (string, error) {
-	res, err := c.messages.CIM.AssociatedPowerManagementService.Get()
-	if err != nil {
+func (c *Client) FetchPowerState(ctx context.Context) (string, error) {
+	var res powerStateResponse
+
+	if err := c.post(ctx, getAction, associatedPowerResource, nil, &res); err != nil {
 		return "", fmt.Errorf("read power state: %w", err)
 	}
 
-	return res.Body.AssociatedPowerManagementService.PowerState.String(), nil
+	return powerStateName(res.PowerState), nil
 }
 
 // Info is what a device reports about itself; unreported fields stay empty.
@@ -115,44 +136,47 @@ type Info struct {
 	ControlMode  string
 }
 
-func (c *Client) FetchInfo() (Info, error) {
-	state, err := c.FetchPowerState()
+func (c *Client) FetchInfo(ctx context.Context) (Info, error) {
+	state, err := c.FetchPowerState(ctx)
 	if err != nil {
 		return Info{}, err
 	}
 
-	version, err := c.fetchVersion()
+	version, err := c.fetchVersion(ctx)
 	if err != nil {
 		return Info{}, err
 	}
 
-	res, err := c.messages.AMT.SetupAndConfigurationService.Get()
-	if err != nil {
+	var setup setupResponse
+
+	if err := c.post(ctx, getAction, setupAndConfigurationResource, nil, &setup); err != nil {
 		return Info{}, fmt.Errorf("read setup and configuration: %w", err)
 	}
-
-	setup := res.Body.GetResponse
 
 	return Info{
 		Power:        state,
 		Version:      version,
-		Provisioning: provisioning(setup.ProvisioningState),
-		ControlMode:  controlMode(setup.ProvisioningMode),
+		Provisioning: provisioning(setup.Service.ProvisioningState),
+		ControlMode:  controlMode(setup.Service.ProvisioningMode),
 	}, nil
 }
 
-func (c *Client) fetchVersion() (string, error) {
-	enumerated, err := c.messages.CIM.SoftwareIdentity.Enumerate()
-	if err != nil {
+// fetchVersion reports the firmware version, or "" when AMT does not list one.
+func (c *Client) fetchVersion(ctx context.Context) (string, error) {
+	var enumerated enumerateResponse
+
+	body := enumerateInput{XMLNS: enumerationNS}
+	if err := c.post(ctx, enumerateAction, softwareIdentityResource, body, &enumerated); err != nil {
 		return "", fmt.Errorf("enumerate software identities: %w", err)
 	}
 
-	pulled, err := c.messages.CIM.SoftwareIdentity.Pull(enumerated.Body.EnumerateResponse.EnumerationContext)
-	if err != nil {
+	var pulled softwareIdentityResponse
+
+	if err := c.post(ctx, pullAction, softwareIdentityResource, pull(enumerated.Context), &pulled); err != nil {
 		return "", fmt.Errorf("read software identities: %w", err)
 	}
 
-	for _, item := range pulled.Body.PullResponse.SoftwareIdentityItems {
+	for _, item := range pulled.Items {
 		if item.InstanceID == amtFirmware {
 			return item.VersionString, nil
 		}
@@ -161,24 +185,42 @@ func (c *Client) fetchVersion() (string, error) {
 	return "", nil
 }
 
-func provisioning(state setupandconfiguration.ProvisioningStateValue) string {
+// AMT_SetupAndConfigurationService.ProvisioningState.
+const (
+	preProvisioning  = 0
+	inProvisioning   = 1
+	postProvisioning = 2
+)
+
+// provisioning names how far setup has got, or "" for a value AMT has added
+// since.
+func provisioning(state int) string {
 	switch state {
-	case setupandconfiguration.PreProvisioning:
+	case preProvisioning:
 		return "Pre"
-	case setupandconfiguration.InProvisioning:
+	case inProvisioning:
 		return "In"
-	case setupandconfiguration.PostProvisioning:
+	case postProvisioning:
 		return "Post"
 	}
 
 	return ""
 }
 
-func controlMode(mode setupandconfiguration.ProvisioningModeValue) string {
+// AMT_SetupAndConfigurationService.ProvisioningMode. The values are not
+// contiguous and 0 means the field was not reported.
+const (
+	adminControlMode  = 1
+	clientControlMode = 4
+)
+
+// controlMode names how much of AMT the credentials reach, or "" when the
+// device does not report it.
+func controlMode(mode int) string {
 	switch mode {
-	case setupandconfiguration.AdminControlMode:
+	case adminControlMode:
 		return "Admin"
-	case setupandconfiguration.ClientControlMode:
+	case clientControlMode:
 		return "Client"
 	}
 
@@ -187,22 +229,23 @@ func controlMode(mode setupandconfiguration.ProvisioningModeValue) string {
 
 // Devices lists the machine's boot sources: ParseDevice names where known, raw
 // instance IDs otherwise.
-func (c *Client) Devices() ([]string, error) {
-	enumerated, err := c.messages.CIM.BootSourceSetting.Enumerate()
-	if err != nil {
+func (c *Client) Devices(ctx context.Context) ([]string, error) {
+	var enumerated enumerateResponse
+
+	body := enumerateInput{XMLNS: enumerationNS}
+	if err := c.post(ctx, enumerateAction, bootSourceSettingResource, body, &enumerated); err != nil {
 		return nil, fmt.Errorf("enumerate boot sources: %w", err)
 	}
 
-	pulled, err := c.messages.CIM.BootSourceSetting.Pull(enumerated.Body.EnumerateResponse.EnumerationContext)
-	if err != nil {
+	var pulled pullResponse
+
+	if err := c.post(ctx, pullAction, bootSourceSettingResource, pull(enumerated.Context), &pulled); err != nil {
 		return nil, fmt.Errorf("read boot sources: %w", err)
 	}
 
-	items := pulled.Body.PullResponse.BootSourceSettingItems
-	names := make([]string, 0, len(items))
-
-	for _, item := range items {
-		names = append(names, deviceName(item.InstanceID))
+	names := make([]string, 0, len(pulled.InstanceIDs))
+	for _, id := range pulled.InstanceIDs {
+		names = append(names, deviceName(id))
 	}
 
 	return names, nil
@@ -221,54 +264,61 @@ func deviceName(instanceID string) string {
 // ForceBoot stages a one-time boot from device, then applies the power action.
 // Order matters: settings are consulted only once a boot source is set, and the
 // source only takes effect once promoted to next boot.
-func (c *Client) ForceBoot(device cimboot.Source, state power.PowerState) error {
-	current, err := c.messages.AMT.BootSettingData.Get()
-	if err != nil {
+func (c *Client) ForceBoot(ctx context.Context, device Source, state PowerState) error {
+	var current bootSettingsResponse
+
+	if err := c.post(ctx, getAction, bootSettingDataResource, nil, &current); err != nil {
 		return fmt.Errorf("read boot settings: %w", err)
 	}
 
-	settings := current.Body.BootSettingDataGetResponse
+	settings := current.Settings
 
-	req := amtboot.BootSettingDataRequest{
-		InstanceID:     settings.InstanceID,
-		ElementName:    settings.ElementName,
-		OwningEntity:   settings.OwningEntity,
-		IDERBootDevice: settings.IDERBootDevice,
-		// 0 is the first device of the chosen type; a boot source rules out
-		// the BIOS-screen options.
-		BootMediaIndex: 0,
-		BIOSPause:      false,
-		BIOSSetup:      false,
-		ReflashBIOS:    false,
-		UseIDER:        false,
+	// Every field left out below stays at its zero value on the wire: media
+	// index 0 is the first device of the chosen type, and a boot source rules
+	// out the BIOS-screen, IDER and erase options.
+	req := bootSettingData{
+		H:                    bootSettingDataResource,
+		InstanceID:           settings.InstanceID,
+		ElementName:          settings.ElementName,
+		OwningEntity:         settings.OwningEntity,
+		IDERBootDevice:       settings.IDERBootDevice,
+		LockKeyboard:         settings.LockKeyboard,
+		LockPowerButton:      settings.LockPowerButton,
+		LockResetButton:      settings.LockResetButton,
+		LockSleepButton:      settings.LockSleepButton,
+		FirmwareVerbosity:    settings.FirmwareVerbosity,
+		ForcedProgressEvents: settings.ForcedProgressEvents,
+		UserPasswordBypass:   settings.UserPasswordBypass,
+		UseSafeMode:          settings.UseSafeMode,
+		EnforceSecureBoot:    settings.EnforceSecureBoot,
 		// Serial console during the forced boot, matching console=ttyS0 kargs.
-		UseSOL:                 true,
-		ConfigurationDataReset: false,
-		SecureErase:            false,
-		LockKeyboard:           settings.LockKeyboard,
-		LockPowerButton:        settings.LockPowerButton,
-		LockResetButton:        settings.LockResetButton,
-		LockSleepButton:        settings.LockSleepButton,
-		FirmwareVerbosity:      settings.FirmwareVerbosity,
-		ForcedProgressEvents:   settings.ForcedProgressEvents,
-		UserPasswordBypass:     settings.UserPasswordBypass,
-		UseSafeMode:            settings.UseSafeMode,
-		EnforceSecureBoot:      settings.EnforceSecureBoot,
+		UseSOL: true,
 	}
 
-	if _, err := c.messages.AMT.BootSettingData.Put(req); err != nil {
+	if err := c.post(ctx, putAction, bootSettingDataResource, req, nil); err != nil {
 		return fmt.Errorf("write boot settings: %w", err)
 	}
 
-	if _, err := c.messages.CIM.BootConfigSetting.ChangeBootOrder(device); err != nil {
+	order := changeBootOrderInput{
+		H:      bootConfigSettingResource,
+		Source: reference(bootSourceSettingResource, instance(string(device))),
+	}
+
+	if err := c.post(ctx, bootConfigSettingResource+"/ChangeBootOrder", bootConfigSettingResource, order, nil); err != nil {
 		return fmt.Errorf("set boot source: %w", err)
 	}
 
-	if _, err := c.messages.CIM.BootService.SetBootConfigRole(bootConfig0, isNextSingleUse); err != nil {
+	role := setBootConfigRoleInput{
+		H:                 bootServiceResource,
+		BootConfigSetting: reference(bootConfigSettingResource, instance(bootConfig0)),
+		Role:              isNextSingleUse,
+	}
+
+	if err := c.post(ctx, bootServiceResource+"/SetBootConfigRole", bootServiceResource, role, nil); err != nil {
 		return fmt.Errorf("arm one-time boot override: %w", err)
 	}
 
-	return c.ChangePower(state)
+	return c.ChangePower(ctx, state)
 }
 
 // Event is one decoded record of the AMT hardware event log.
@@ -279,9 +329,15 @@ type Event struct {
 	Description string
 }
 
+// AMT_MessageLog.GetRecords return values amtctl acts on.
+const (
+	recordsRead     = 0
+	recordsEmptyLog = 3
+)
+
 // Events reads the firmware event log, newest record first. The log survives
 // the OS, so it answers why a machine went down.
-func (c *Client) Events() ([]Event, error) {
+func (c *Client) Events(ctx context.Context) ([]Event, error) {
 	var events []Event
 
 	// AMT ignores PositionToFirstRecord, so the read position goes to GetRecords
@@ -289,36 +345,104 @@ func (c *Client) Events() ([]Event, error) {
 	position := 1
 
 	for {
-		res, err := c.messages.AMT.MessageLog.GetRecords(position, messagelog.MaxAMTRecords)
-		if err != nil {
+		body := getRecordsInput{
+			H:                   messageLogResource,
+			IterationIdentifier: position,
+			MaxReadRecords:      maxReadRecords,
+		}
+
+		var res getRecordsResponse
+
+		if err := c.post(ctx, messageLogResource+"/GetRecords", messageLogResource, body, &res); err != nil {
 			return nil, fmt.Errorf("read event log: %w", err)
 		}
 
-		records := res.Body.GetRecordsResponse
+		records := res.Records
 
-		if rv := records.ReturnValue; rv != messagelog.GetRecordsReturnValueCompletedWithNoError {
+		if rv := records.ReturnValue; rv != recordsRead {
 			// An empty log is a return value, not an empty record array.
-			if rv == messagelog.GetRecordsReturnValueNoRecordExistsInLog {
+			if rv == recordsEmptyLog {
 				return events, nil
 			}
 
-			return nil, fmt.Errorf("read event log: %s", rv)
+			return nil, fmt.Errorf("read event log: %s", recordsResultName(rv))
 		}
 
-		for _, record := range records.RefinedEventData {
-			events = append(events, Event{
-				Time:        record.TimeStamp,
-				Severity:    record.EventSeverity,
-				Entity:      record.Entity,
-				Description: record.Description,
-			})
+		for _, encoded := range records.RecordArray {
+			event, err := decodeEvent(encoded)
+			if err != nil {
+				return nil, fmt.Errorf("read event log: %w", err)
+			}
+
+			events = append(events, event)
 		}
 
 		// The empty page also stops a device that never sets NoMoreRecords.
-		if records.NoMoreRecords || len(records.RefinedEventData) == 0 {
+		if records.NoMoreRecords || len(records.RecordArray) == 0 {
 			return events, nil
 		}
 
-		position += len(records.RefinedEventData)
+		position += len(records.RecordArray)
 	}
+}
+
+// unknownValue names an enumeration value this build has no name for, keeping
+// the number the firmware reported in front of the operator.
+func unknownValue(value int) string {
+	return "unknown (" + strconv.Itoa(value) + ")"
+}
+
+// powerStateName renders CIM_AssociatedPowerManagementService.PowerState, whose
+// values run from 1.
+func powerStateName(state int) string {
+	names := []string{
+		"Other", "On", "SleepLight", "SleepDeep", "PowerCycleSoft", "OffHard",
+		"Hibernate", "OffSoft", "PowerCycleHard", "MasterBusReset",
+		"DiagnosticInterruptNMI", "PowerOffSoftGraceful", "PowerOffHardGraceful",
+		"MasterBusResetGraceful", "PowerCycleSoftGraceful", "PowerCycleHardGraceful",
+		"DiagnosticInterruptINIT",
+	}
+
+	if state < 1 || state > len(names) {
+		return unknownValue(state)
+	}
+
+	return names[state-1]
+}
+
+// jobResultBase is where DMTF's second block of return values starts.
+const jobResultBase = 4096
+
+// returnValueName renders a RequestPowerStateChange result.
+func returnValueName(value int) string {
+	results := []string{
+		"CompletedWithNoError", "MethodNotSupported", "UnknownError",
+		"CannotCompleteWithinTimeoutPeriod", "Failed", "InvalidParameter", "InUse",
+	}
+	jobResults := []string{
+		"MethodParametersCheckedJobStarted", "InvalidStateTransition",
+		"UseOfTimeoutParameterNotSupported", "Busy",
+	}
+
+	switch {
+	case value >= 0 && value < len(results):
+		return results[value]
+	case value >= jobResultBase && value < jobResultBase+len(jobResults):
+		return jobResults[value-jobResultBase]
+	default:
+		return unknownValue(value)
+	}
+}
+
+// recordsResultName renders an AMT_MessageLog.GetRecords result.
+func recordsResultName(value int) string {
+	names := []string{
+		"CompletedWithNoError", "NotSupported", "InvalidRecordPointed", "NoRecordExistsInLog",
+	}
+
+	if value < 0 || value >= len(names) {
+		return unknownValue(value)
+	}
+
+	return names[value]
 }

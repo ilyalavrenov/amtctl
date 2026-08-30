@@ -14,9 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman"
-	cimboot "github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/cim/boot"
-	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/cim/power"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -50,12 +47,7 @@ func (d *device) serve(t *testing.T) *Client {
 	srv := httptest.NewServer(d)
 	t.Cleanup(srv.Close)
 
-	// A distinct target per test keeps the library's per-host connection limiter
-	// from coupling parallel tests.
-	params := parameters(strings.ReplaceAll(t.Name(), "/", "-"), "admin", "secret", false)
-	params.Transport = redirect{srv.Listener.Addr().String()}
-
-	return &Client{messages: wsman.NewMessages(params)}
+	return newClient(srv.URL+"/wsman", "admin", "secret")
 }
 
 func (d *device) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -203,17 +195,6 @@ func envelope(body string) string {
 	return `<?xml version="1.0" encoding="utf-8"?><Envelope><Header/><Body>` + body + `</Body></Envelope>`
 }
 
-// redirect points the library's requests at the test server; the endpoint it
-// builds carries a hardcoded port.
-type redirect struct{ addr string }
-
-func (t redirect) RoundTrip(r *http.Request) (*http.Response, error) {
-	r = r.Clone(r.Context())
-	r.URL.Host = t.addr
-
-	return http.DefaultTransport.RoundTrip(r)
-}
-
 // bootSettings is the part of a BootSettingData Put that ForceBoot decides.
 type bootSettings struct {
 	InstanceID     string `xml:"Body>AMT_BootSettingData>InstanceID"`
@@ -231,7 +212,7 @@ func TestForceBoot(t *testing.T) {
 	d := &device{}
 	c := d.serve(t)
 
-	require.NoError(t, c.ForceBoot(cimboot.HardDrive, power.PowerOn))
+	require.NoError(t, c.ForceBoot(t.Context(), hardDrive, powerOn))
 
 	// The order is the invariant, and the machine must not move until both the
 	// settings and the source are in place.
@@ -255,7 +236,7 @@ func TestForceBoot(t *testing.T) {
 		UseSOL:       true,
 	}, got)
 
-	assert.Contains(t, d.body("CIM_BootConfigSetting.ChangeBootOrder"), string(cimboot.HardDrive))
+	assert.Contains(t, d.body("CIM_BootConfigSetting.ChangeBootOrder"), string(hardDrive))
 }
 
 // A failed step must stop the sequence. Powering the machine on with a
@@ -266,7 +247,7 @@ func TestForceBootStopsAtTheFirstFailure(t *testing.T) {
 	d := &device{reject: "CIM_BootConfigSetting.ChangeBootOrder"}
 	c := d.serve(t)
 
-	require.ErrorContains(t, c.ForceBoot(cimboot.PXE, power.PowerOn), "set boot source")
+	require.ErrorContains(t, c.ForceBoot(t.Context(), pxe, powerOn), "set boot source")
 	assert.Equal(t, []string{
 		"AMT_BootSettingData.Get",
 		"AMT_BootSettingData.Put",
@@ -281,7 +262,7 @@ func TestChangePowerReportsARefusedTransition(t *testing.T) {
 	d := &device{powerReturn: 2}
 	c := d.serve(t)
 
-	require.ErrorContains(t, c.ChangePower(power.PowerOn), "power state change rejected")
+	assert.ErrorContains(t, c.ChangePower(t.Context(), powerOn), "power state change rejected")
 }
 
 func TestDevices(t *testing.T) {
@@ -290,7 +271,7 @@ func TestDevices(t *testing.T) {
 	d := &device{}
 	c := d.serve(t)
 
-	got, err := c.Devices()
+	got, err := c.Devices(t.Context())
 	require.NoError(t, err)
 
 	// Known sources come back as the --device values; the rest stay raw.
@@ -304,7 +285,7 @@ func TestFetchInfo(t *testing.T) {
 	d := &device{}
 	c := d.serve(t)
 
-	got, err := c.FetchInfo()
+	got, err := c.FetchInfo(t.Context())
 	require.NoError(t, err)
 
 	assert.Equal(t, Info{
@@ -329,7 +310,7 @@ func TestFetchInfoLeavesUnreportedFieldsEmpty(t *testing.T) {
 	d := &device{sparse: true}
 	c := d.serve(t)
 
-	got, err := c.FetchInfo()
+	got, err := c.FetchInfo(t.Context())
 	require.NoError(t, err)
 
 	assert.Equal(t, Info{Power: "On", Provisioning: "Post"}, got)
@@ -341,19 +322,27 @@ func TestFetchInfoFailsOnARefusedCall(t *testing.T) {
 	d := &device{reject: "CIM_SoftwareIdentity.Pull"}
 	c := d.serve(t)
 
-	_, err := c.FetchInfo()
-	require.ErrorContains(t, err, "read software identities")
+	_, err := c.FetchInfo(t.Context())
+	assert.ErrorContains(t, err, "read software identities")
+}
+
+func TestPowerStateName(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "On", powerStateName(2))
+	assert.Equal(t, "OffSoft", powerStateName(8))
+	assert.Equal(t, "unknown (99)", powerStateName(99))
 }
 
 func TestParseDeviceRejectsUnknown(t *testing.T) {
 	t.Parallel()
 
 	_, err := ParseDevice("floppy")
-	require.ErrorContains(t, err, "unknown boot device")
+	assert.ErrorContains(t, err, "unknown boot device")
 }
 
 // eventRecord is the 21-byte record AMT stores per event. Only the fields the
-// library decodes are set.
+// decoder reads are set.
 type eventRecord struct {
 	timestamp  uint32
 	sensorType uint8
@@ -386,11 +375,11 @@ func TestEvents(t *testing.T) {
 	}}}
 	c := d.serve(t)
 
-	got, err := c.Events()
+	got, err := c.Events(t.Context())
 	require.NoError(t, err)
 
-	// The last record is a sensor type the library has no text for; it still has
-	// to reach the caller, since severity and entity carry the diagnosis.
+	// The last record is a sensor type amtctl has no text for; it still has to
+	// reach the caller, since severity and entity carry the diagnosis.
 	assert.Equal(t, []Event{
 		{
 			Time:        time.Unix(1700000000, 0),
@@ -428,7 +417,7 @@ func TestEventsReadsEveryPage(t *testing.T) {
 	d := &device{logPages: [][]string{{record, record}, {record}}}
 	c := d.serve(t)
 
-	got, err := c.Events()
+	got, err := c.Events(t.Context())
 	require.NoError(t, err)
 
 	assert.Len(t, got, 3)
@@ -445,7 +434,7 @@ func TestEventsReadsAnEmptyLog(t *testing.T) {
 	d := &device{logReturn: 3}
 	c := d.serve(t)
 
-	got, err := c.Events()
+	got, err := c.Events(t.Context())
 	require.NoError(t, err)
 	assert.Empty(t, got)
 	assert.Equal(t, []string{"AMT_MessageLog.GetRecords"}, d.recorded())
@@ -457,6 +446,6 @@ func TestEventsReportsARefusedRead(t *testing.T) {
 	d := &device{logReturn: 1}
 	c := d.serve(t)
 
-	_, err := c.Events()
-	require.ErrorContains(t, err, "NotSupported")
+	_, err := c.Events(t.Context())
+	assert.ErrorContains(t, err, "NotSupported")
 }
