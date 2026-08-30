@@ -3,8 +3,10 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/urfave/cli/v3"
@@ -89,19 +91,38 @@ func client(cmd *cli.Command) *amt.Client {
 func infoCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "info",
-		Usage: "report the current power state",
+		Usage: "report the power state and what AMT reports about itself",
 		Flags: connectionFlags(),
 		Action: func(_ context.Context, cmd *cli.Command) error {
-			state, err := client(cmd).FetchPowerState()
+			info, err := client(cmd).FetchInfo()
 			if err != nil {
 				return err
 			}
 
-			fmt.Fprintln(cmd.Writer, state)
+			writeInfo(cmd.Writer, info)
 
 			return nil
 		},
 	}
+}
+
+func writeInfo(w io.Writer, info amt.Info) {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+
+	for _, field := range [][2]string{
+		{"power", info.Power},
+		{"version", info.Version},
+		{"provisioning", info.Provisioning},
+		{"control-mode", info.ControlMode},
+	} {
+		if field[1] == "" {
+			continue
+		}
+
+		fmt.Fprintf(tw, "%s\t%s\n", field[0], field[1])
+	}
+
+	_ = tw.Flush()
 }
 
 func powerCommand() *cli.Command {
