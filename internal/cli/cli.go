@@ -52,6 +52,7 @@ func connectionFlags() []cli.Flag {
 		&cli.StringFlag{
 			Name:     flagHost,
 			Usage:    "AMT host or IP",
+			Sources:  cli.EnvVars("AMT_HOST"),
 			Required: true,
 		},
 		&cli.BoolFlag{

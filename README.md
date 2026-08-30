@@ -23,7 +23,8 @@ amtctl power   --host amt.example.com --state reset    # on | off | reset | cycl
 amtctl sol     --host amt.example.com                  # serial console, Ctrl-] to detach
 ```
 
-Credentials come from `AMT_USER` / `AMT_PASS`, or from `--user` / `--pass`.
+Host and credentials come from `AMT_HOST` / `AMT_USER` / `AMT_PASS`, or from
+`--host` / `--user` / `--pass`.
 
 `--tls` switches to the TLS ports (16993 WSMAN, 16995 redirection). AMT's default
 certificate is self-signed and is **not** verified.
