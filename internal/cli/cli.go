@@ -19,11 +19,12 @@ import (
 const dialTimeout = 15 * time.Second
 
 const (
-	flagHost  = "host"
-	flagTLS   = "tls"
-	flagUser  = "user"
-	flagPass  = "pass"
-	flagState = "state"
+	flagHost   = "host"
+	flagTLS    = "tls"
+	flagUser   = "user"
+	flagPass   = "pass"
+	flagState  = "state"
+	flagDevice = "device"
 )
 
 // Run executes the command tree against argv. Cancelling ctx aborts the console
@@ -36,8 +37,9 @@ func Run(ctx context.Context, version string, osArgs []string) error {
 		EnableShellCompletion: true,
 		Commands: []*cli.Command{
 			infoCommand(),
+			devicesCommand(),
+			bootCommand(),
 			powerCommand(),
-			pxeCommand(),
 			solCommand(),
 		},
 	}
@@ -117,20 +119,49 @@ func powerCommand() *cli.Command {
 	}
 }
 
-func pxeCommand() *cli.Command {
+func devicesCommand() *cli.Command {
 	return &cli.Command{
-		Name:  "pxe",
-		Usage: "force a one-time PXE boot, then apply the power action",
-		Description: "Stages the boot override and enables serial-over-LAN for the next boot, " +
-			"so `amtctl sol` shows the PXE boot it triggers.",
-		Flags: append(connectionFlags(), stateFlag("reset")),
+		Name:  "devices",
+		Usage: "list the boot devices this machine reports",
+		Flags: connectionFlags(),
 		Action: func(_ context.Context, cmd *cli.Command) error {
+			names, err := client(cmd).Devices()
+			if err != nil {
+				return err
+			}
+
+			for _, name := range names {
+				fmt.Fprintln(cmd.Writer, name)
+			}
+
+			return nil
+		},
+	}
+}
+
+func bootCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "boot",
+		Usage: "force a one-time boot from a device, then apply the power action",
+		Description: "Stages the boot override and enables serial-over-LAN for the next boot, " +
+			"so `amtctl sol` shows the boot it triggers.",
+		Flags: append(connectionFlags(), &cli.StringFlag{
+			Name:  flagDevice,
+			Value: "pxe",
+			Usage: "boot device: " + strings.Join(amt.DeviceNames(), "|"),
+		}, stateFlag("reset")),
+		Action: func(_ context.Context, cmd *cli.Command) error {
+			device, err := amt.ParseDevice(cmd.String(flagDevice))
+			if err != nil {
+				return err
+			}
+
 			state, err := amt.ParseState(cmd.String(flagState))
 			if err != nil {
 				return err
 			}
 
-			return client(cmd).ForcePXE(state)
+			return client(cmd).ForceBoot(device, state)
 		},
 	}
 }

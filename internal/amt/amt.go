@@ -20,13 +20,28 @@ const isNextSingleUse = 1
 
 const requestTimeout = 30 * time.Second
 
-type PowerState = power.PowerState
-
 func StateNames() []string {
 	return []string{"on", "off", "reset", "cycle"}
 }
 
-func ParseState(name string) (PowerState, error) {
+func DeviceNames() []string {
+	return []string{"pxe", "hdd", "cd"}
+}
+
+func ParseDevice(name string) (cimboot.Source, error) {
+	switch name {
+	case "pxe":
+		return cimboot.PXE, nil
+	case "hdd":
+		return cimboot.HardDrive, nil
+	case "cd":
+		return cimboot.CD, nil
+	default:
+		return "", fmt.Errorf("unknown boot device %q, want %s", name, strings.Join(DeviceNames(), "|"))
+	}
+}
+
+func ParseState(name string) (power.PowerState, error) {
 	switch name {
 	case "on":
 		return power.PowerOn, nil
@@ -66,7 +81,7 @@ func parameters(host, user, pass string, useTLS bool) client.Parameters {
 }
 
 // ChangePower errors if AMT accepted the request but refused the transition.
-func (c *Client) ChangePower(state PowerState) error {
+func (c *Client) ChangePower(state power.PowerState) error {
 	res, err := c.messages.CIM.PowerManagementService.RequestPowerStateChange(state)
 	if err != nil {
 		return fmt.Errorf("request power state change: %w", err)
@@ -88,10 +103,43 @@ func (c *Client) FetchPowerState() (string, error) {
 	return res.Body.AssociatedPowerManagementService.PowerState.String(), nil
 }
 
-// ForcePXE stages a one-time PXE boot, then applies the power action. Order
-// matters: settings are consulted only once a boot source is set, and the source
-// only takes effect once promoted to next boot.
-func (c *Client) ForcePXE(state PowerState) error {
+// Devices lists the machine's boot sources: ParseDevice names where known, raw
+// instance IDs otherwise.
+func (c *Client) Devices() ([]string, error) {
+	enumerated, err := c.messages.CIM.BootSourceSetting.Enumerate()
+	if err != nil {
+		return nil, fmt.Errorf("enumerate boot sources: %w", err)
+	}
+
+	pulled, err := c.messages.CIM.BootSourceSetting.Pull(enumerated.Body.EnumerateResponse.EnumerationContext)
+	if err != nil {
+		return nil, fmt.Errorf("read boot sources: %w", err)
+	}
+
+	items := pulled.Body.PullResponse.BootSourceSettingItems
+	names := make([]string, 0, len(items))
+
+	for _, item := range items {
+		names = append(names, deviceName(item.InstanceID))
+	}
+
+	return names, nil
+}
+
+func deviceName(instanceID string) string {
+	for _, name := range DeviceNames() {
+		if device, err := ParseDevice(name); err == nil && string(device) == instanceID {
+			return name
+		}
+	}
+
+	return instanceID
+}
+
+// ForceBoot stages a one-time boot from device, then applies the power action.
+// Order matters: settings are consulted only once a boot source is set, and the
+// source only takes effect once promoted to next boot.
+func (c *Client) ForceBoot(device cimboot.Source, state power.PowerState) error {
 	current, err := c.messages.AMT.BootSettingData.Get()
 	if err != nil {
 		return fmt.Errorf("read boot settings: %w", err)
@@ -104,14 +152,14 @@ func (c *Client) ForcePXE(state PowerState) error {
 		ElementName:    settings.ElementName,
 		OwningEntity:   settings.OwningEntity,
 		IDERBootDevice: settings.IDERBootDevice,
-		// PXE requires index 0, and a boot source rules out the BIOS-screen
-		// options.
+		// 0 is the first device of the chosen type; a boot source rules out
+		// the BIOS-screen options.
 		BootMediaIndex: 0,
 		BIOSPause:      false,
 		BIOSSetup:      false,
 		ReflashBIOS:    false,
 		UseIDER:        false,
-		// Serial console during the PXE boot, matching console=ttyS0 kargs.
+		// Serial console during the forced boot, matching console=ttyS0 kargs.
 		UseSOL:                 true,
 		ConfigurationDataReset: false,
 		SecureErase:            false,
@@ -130,8 +178,8 @@ func (c *Client) ForcePXE(state PowerState) error {
 		return fmt.Errorf("write boot settings: %w", err)
 	}
 
-	if _, err := c.messages.CIM.BootConfigSetting.ChangeBootOrder(cimboot.PXE); err != nil {
-		return fmt.Errorf("set PXE boot source: %w", err)
+	if _, err := c.messages.CIM.BootConfigSetting.ChangeBootOrder(device); err != nil {
+		return fmt.Errorf("set boot source: %w", err)
 	}
 
 	if _, err := c.messages.CIM.BootService.SetBootConfigRole(bootConfig0, isNextSingleUse); err != nil {

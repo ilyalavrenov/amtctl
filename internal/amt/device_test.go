@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman"
+	cimboot "github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/cim/boot"
 	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/cim/power"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -99,6 +100,15 @@ func (d *device) answer(call string) (string, bool) {
 			`</AMT_BootSettingData>`), true
 	case "AMT_BootSettingData.Put", "CIM_BootConfigSetting.ChangeBootOrder", "CIM_BootService.SetBootConfigRole":
 		return envelope(""), true
+	case "CIM_BootSourceSetting.Enumerate":
+		return envelope("<EnumerateResponse><EnumerationContext>ctx</EnumerationContext></EnumerateResponse>"), true
+	case "CIM_BootSourceSetting.Pull":
+		// One source with no short name, so the raw instance ID has to survive.
+		return envelope("<PullResponse><Items>" +
+			sourceItem("Intel(r) AMT: Force PXE Boot") +
+			sourceItem("Intel(r) AMT: Force Hard-drive Boot") +
+			sourceItem("Intel(r) AMT: Force OCR UEFI HTTPS Boot") +
+			"</Items></PullResponse>"), true
 	case "CIM_PowerManagementService.RequestPowerStateChange":
 		return envelope("<RequestPowerStateChange_OUTPUT><ReturnValue>" +
 			strconv.Itoa(d.powerReturn) + "</ReturnValue></RequestPowerStateChange_OUTPUT>"), true
@@ -122,6 +132,10 @@ func (d *device) body(call string) string {
 	return d.bodies[call]
 }
 
+func sourceItem(instanceID string) string {
+	return "<CIM_BootSourceSetting><InstanceID>" + instanceID + "</InstanceID></CIM_BootSourceSetting>"
+}
+
 func envelope(body string) string {
 	return `<?xml version="1.0" encoding="utf-8"?><Envelope><Header/><Body>` + body + `</Body></Envelope>`
 }
@@ -137,7 +151,7 @@ func (t redirect) RoundTrip(r *http.Request) (*http.Response, error) {
 	return http.DefaultTransport.RoundTrip(r)
 }
 
-// bootSettings is the part of a BootSettingData Put that ForcePXE decides.
+// bootSettings is the part of a BootSettingData Put that ForceBoot decides.
 type bootSettings struct {
 	InstanceID     string `xml:"Body>AMT_BootSettingData>InstanceID"`
 	ElementName    string `xml:"Body>AMT_BootSettingData>ElementName"`
@@ -148,17 +162,16 @@ type bootSettings struct {
 	LockKeyboard   bool   `xml:"Body>AMT_BootSettingData>LockKeyboard"`
 }
 
-func TestForcePXE(t *testing.T) {
+func TestForceBoot(t *testing.T) {
 	t.Parallel()
 
 	d := &device{}
 	c := d.serve(t)
 
-	require.NoError(t, c.ForcePXE(power.PowerOn))
+	require.NoError(t, c.ForceBoot(cimboot.HardDrive, power.PowerOn))
 
-	// The order is the invariant: settings are consulted only once a source is
-	// set, the source takes effect only once promoted to next boot, and the
-	// machine must not move until both are done.
+	// The order is the invariant, and the machine must not move until both the
+	// settings and the source are in place.
 	assert.Equal(t, []string{
 		"AMT_BootSettingData.Get",
 		"AMT_BootSettingData.Put",
@@ -171,24 +184,26 @@ func TestForcePXE(t *testing.T) {
 
 	require.NoError(t, xml.Unmarshal([]byte(d.body("AMT_BootSettingData.Put")), &got))
 
-	// Reported fields are echoed back; the ones a PXE boot rules out are cleared.
+	// Reported fields are echoed back; the ones a forced boot rules out are cleared.
 	assert.Equal(t, bootSettings{
 		InstanceID:   "Intel(r) AMT:BootSettingData 0",
 		ElementName:  "Boot Configuration",
 		LockKeyboard: true,
 		UseSOL:       true,
 	}, got)
+
+	assert.Contains(t, d.body("CIM_BootConfigSetting.ChangeBootOrder"), string(cimboot.HardDrive))
 }
 
 // A failed step must stop the sequence. Powering the machine on with a
 // half-armed override boots whatever was configured before.
-func TestForcePXEStopsAtTheFirstFailure(t *testing.T) {
+func TestForceBootStopsAtTheFirstFailure(t *testing.T) {
 	t.Parallel()
 
 	d := &device{reject: "CIM_BootConfigSetting.ChangeBootOrder"}
 	c := d.serve(t)
 
-	require.ErrorContains(t, c.ForcePXE(power.PowerOn), "set PXE boot source")
+	require.ErrorContains(t, c.ForceBoot(cimboot.PXE, power.PowerOn), "set boot source")
 	assert.Equal(t, []string{
 		"AMT_BootSettingData.Get",
 		"AMT_BootSettingData.Put",
@@ -204,4 +219,25 @@ func TestChangePowerReportsARefusedTransition(t *testing.T) {
 	c := d.serve(t)
 
 	require.ErrorContains(t, c.ChangePower(power.PowerOn), "power state change rejected")
+}
+
+func TestDevices(t *testing.T) {
+	t.Parallel()
+
+	d := &device{}
+	c := d.serve(t)
+
+	got, err := c.Devices()
+	require.NoError(t, err)
+
+	// Known sources come back as the --device values; the rest stay raw.
+	assert.Equal(t, []string{"pxe", "hdd", "Intel(r) AMT: Force OCR UEFI HTTPS Boot"}, got)
+	assert.Equal(t, []string{"CIM_BootSourceSetting.Enumerate", "CIM_BootSourceSetting.Pull"}, d.recorded())
+}
+
+func TestParseDeviceRejectsUnknown(t *testing.T) {
+	t.Parallel()
+
+	_, err := ParseDevice("floppy")
+	require.ErrorContains(t, err, "unknown boot device")
 }

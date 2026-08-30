@@ -16,10 +16,11 @@ Or download a binary from the [releases page](https://github.com/ilyalavrenov/am
 ```bash
 export AMT_USER=admin AMT_PASS=...
 
-amtctl info  --host amt.example.com                 # current power state
-amtctl power --host amt.example.com --state reset   # on | off | reset | cycle
-amtctl pxe   --host amt.example.com                 # one-time PXE boot, then reset
-amtctl sol   --host amt.example.com                 # serial console, Ctrl-] to detach
+amtctl info    --host amt.example.com                  # current power state
+amtctl devices --host amt.example.com                  # boot devices this machine reports
+amtctl boot    --host amt.example.com --device pxe     # pxe | hdd | cd, then reset
+amtctl power   --host amt.example.com --state reset    # on | off | reset | cycle
+amtctl sol     --host amt.example.com                  # serial console, Ctrl-] to detach
 ```
 
 Credentials come from `AMT_USER` / `AMT_PASS`, or from `--user` / `--pass`.
@@ -27,8 +28,9 @@ Credentials come from `AMT_USER` / `AMT_PASS`, or from `--user` / `--pass`.
 `--tls` switches to the TLS ports (16993 WSMAN, 16995 redirection). AMT's default
 certificate is self-signed and is **not** verified.
 
-`pxe` enables serial-over-LAN for the boot it stages, so `amtctl sol` shows that
-boot. The console stays silent unless the target's kernel logs to one.
+`boot` enables serial-over-LAN for the boot it stages, so `amtctl sol` shows that
+boot. The console stays silent unless the target's kernel logs to one. `devices`
+lists what the machine actually offers.
 
 ## Notes
 
