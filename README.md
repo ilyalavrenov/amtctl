@@ -37,13 +37,7 @@ certificate is self-signed and is **not** verified.
 boot. The console stays silent unless the target's kernel logs to one. `devices`
 lists what the machine actually offers.
 
-## Notes
-
-Power and boot control are WSMAN calls through Intel's
-[go-wsman-messages](https://github.com/device-management-toolkit/go-wsman-messages).
-The console speaks the AMT redirection protocol directly, since no Go library
-packages it.
-
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). The event-log decoder derives from Apache-2.0 code,
+see the header of [internal/amt/eventlog.go](internal/amt/eventlog.go).

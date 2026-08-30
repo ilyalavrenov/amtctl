@@ -31,8 +31,8 @@ const (
 	flagJSON   = "json"
 )
 
-// Run executes the command tree against argv. Cancelling ctx aborts the console
-// session; the WSMAN commands cannot observe it, see amt.parameters.
+// Run executes the command tree against argv. Cancelling ctx aborts whichever
+// command is running.
 func Run(ctx context.Context, version string, osArgs []string) error {
 	return command(version).Run(ctx, osArgs) //nolint:wrapcheck // error is already contextual
 }
@@ -122,8 +122,8 @@ func infoCommand() *cli.Command {
 		Name:  "info",
 		Usage: "report the power state and what AMT reports about itself",
 		Flags: connectionFlags(),
-		Action: func(_ context.Context, cmd *cli.Command) error {
-			info, err := client(cmd).FetchInfo()
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			info, err := client(cmd).FetchInfo(ctx)
 			if err != nil {
 				return err
 			}
@@ -168,13 +168,13 @@ func powerCommand() *cli.Command {
 		Name:  "power",
 		Usage: "change the power state",
 		Flags: append(connectionFlags(), stateFlag("on")),
-		Action: func(_ context.Context, cmd *cli.Command) error {
+		Action: func(ctx context.Context, cmd *cli.Command) error {
 			state, err := amt.ParseState(cmd.String(flagState))
 			if err != nil {
 				return err
 			}
 
-			return client(cmd).ChangePower(state)
+			return client(cmd).ChangePower(ctx, state)
 		},
 	}
 }
@@ -188,8 +188,8 @@ func devicesCommand() *cli.Command {
 		Name:  "devices",
 		Usage: "list the boot devices this machine reports",
 		Flags: connectionFlags(),
-		Action: func(_ context.Context, cmd *cli.Command) error {
-			names, err := client(cmd).Devices()
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			names, err := client(cmd).Devices(ctx)
 			if err != nil {
 				return err
 			}
@@ -218,7 +218,7 @@ func bootCommand() *cli.Command {
 			Value: "pxe",
 			Usage: "boot device: " + strings.Join(amt.DeviceNames(), "|"),
 		}, stateFlag("reset")),
-		Action: func(_ context.Context, cmd *cli.Command) error {
+		Action: func(ctx context.Context, cmd *cli.Command) error {
 			device, err := amt.ParseDevice(cmd.String(flagDevice))
 			if err != nil {
 				return err
@@ -229,7 +229,7 @@ func bootCommand() *cli.Command {
 				return err
 			}
 
-			return client(cmd).ForceBoot(device, state)
+			return client(cmd).ForceBoot(ctx, device, state)
 		},
 	}
 }
@@ -250,8 +250,8 @@ func logCommand() *cli.Command {
 		Name:  "log",
 		Usage: "print the hardware event log, newest record first",
 		Flags: connectionFlags(),
-		Action: func(_ context.Context, cmd *cli.Command) error {
-			events, err := client(cmd).Events()
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			events, err := client(cmd).Events(ctx)
 			if err != nil {
 				return err
 			}
