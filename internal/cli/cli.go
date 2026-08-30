@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -27,16 +28,27 @@ const (
 	flagPass   = "pass"
 	flagState  = "state"
 	flagDevice = "device"
+	flagJSON   = "json"
 )
 
 // Run executes the command tree against argv. Cancelling ctx aborts the console
 // session; the WSMAN commands cannot observe it, see amt.parameters.
 func Run(ctx context.Context, version string, osArgs []string) error {
-	cmd := &cli.Command{
+	return command(version).Run(ctx, osArgs) //nolint:wrapcheck // error is already contextual
+}
+
+func command(version string) *cli.Command {
+	return &cli.Command{
 		Name:                  "amtctl",
 		Usage:                 "out-of-band control for Intel AMT (vPro) machines",
 		Version:               version,
 		EnableShellCompletion: true,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:  flagJSON,
+				Usage: "print machine-readable JSON instead of plain text",
+			},
+		},
 		Commands: []*cli.Command{
 			infoCommand(),
 			devicesCommand(),
@@ -45,8 +57,6 @@ func Run(ctx context.Context, version string, osArgs []string) error {
 			solCommand(),
 		},
 	}
-
-	return cmd.Run(ctx, osArgs) //nolint:wrapcheck // error is already contextual
 }
 
 func connectionFlags() []cli.Flag {
@@ -88,6 +98,24 @@ func client(cmd *cli.Command) *amt.Client {
 	return amt.New(cmd.String(flagHost), cmd.String(flagUser), cmd.String(flagPass), cmd.Bool(flagTLS))
 }
 
+func writeJSON(cmd *cli.Command, out any) error {
+	encoder := json.NewEncoder(cmd.Writer)
+	encoder.SetIndent("", "  ")
+
+	if err := encoder.Encode(out); err != nil {
+		return fmt.Errorf("write json: %w", err)
+	}
+
+	return nil
+}
+
+type infoOutput struct {
+	PowerState   string `json:"power_state"`
+	Version      string `json:"version"`
+	Provisioning string `json:"provisioning"`
+	ControlMode  string `json:"control_mode"`
+}
+
 func infoCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "info",
@@ -97,6 +125,15 @@ func infoCommand() *cli.Command {
 			info, err := client(cmd).FetchInfo()
 			if err != nil {
 				return err
+			}
+
+			if cmd.Bool(flagJSON) {
+				return writeJSON(cmd, infoOutput{
+					PowerState:   info.Power,
+					Version:      info.Version,
+					Provisioning: info.Provisioning,
+					ControlMode:  info.ControlMode,
+				})
 			}
 
 			writeInfo(cmd.Writer, info)
@@ -141,6 +178,10 @@ func powerCommand() *cli.Command {
 	}
 }
 
+type devicesOutput struct {
+	Devices []string `json:"devices"`
+}
+
 func devicesCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "devices",
@@ -150,6 +191,10 @@ func devicesCommand() *cli.Command {
 			names, err := client(cmd).Devices()
 			if err != nil {
 				return err
+			}
+
+			if cmd.Bool(flagJSON) {
+				return writeJSON(cmd, devicesOutput{Devices: names})
 			}
 
 			for _, name := range names {

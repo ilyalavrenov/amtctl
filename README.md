@@ -29,6 +29,8 @@ Host and credentials come from `AMT_HOST` / `AMT_USER` / `AMT_PASS`, or from
 `--tls` switches to the TLS ports (16993 WSMAN, 16995 redirection). AMT's default
 certificate is self-signed and is **not** verified.
 
+`--json` prints output as JSON.
+
 `boot` enables serial-over-LAN for the boot it stages, so `amtctl sol` shows that
 boot. The console stays silent unless the target's kernel logs to one. `devices`
 lists what the machine actually offers.
