@@ -54,6 +54,7 @@ func command(version string) *cli.Command {
 			devicesCommand(),
 			bootCommand(),
 			powerCommand(),
+			logCommand(),
 			solCommand(),
 		},
 	}
@@ -231,6 +232,63 @@ func bootCommand() *cli.Command {
 			return client(cmd).ForceBoot(device, state)
 		},
 	}
+}
+
+type logOutput struct {
+	Events []logEvent `json:"events"`
+}
+
+type logEvent struct {
+	Time        time.Time `json:"time"`
+	Severity    string    `json:"severity"`
+	Entity      string    `json:"entity"`
+	Description string    `json:"description"`
+}
+
+func logCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "log",
+		Usage: "print the hardware event log, newest record first",
+		Flags: connectionFlags(),
+		Action: func(_ context.Context, cmd *cli.Command) error {
+			events, err := client(cmd).Events()
+			if err != nil {
+				return err
+			}
+
+			if cmd.Bool(flagJSON) {
+				return writeJSON(cmd, jsonEvents(events))
+			}
+
+			out := tabwriter.NewWriter(cmd.Writer, 0, 0, 2, ' ', 0)
+
+			for _, event := range events {
+				fmt.Fprintf(out, "%s\t%s\t%s\t%s\n",
+					event.Time.Format(time.RFC3339), event.Severity, event.Entity, event.Description)
+			}
+
+			if err := out.Flush(); err != nil {
+				return fmt.Errorf("write event log: %w", err)
+			}
+
+			return nil
+		},
+	}
+}
+
+func jsonEvents(events []amt.Event) logOutput {
+	out := logOutput{Events: make([]logEvent, 0, len(events))}
+
+	for _, event := range events {
+		out.Events = append(out.Events, logEvent{
+			Time:        event.Time,
+			Severity:    event.Severity,
+			Entity:      event.Entity,
+			Description: event.Description,
+		})
+	}
+
+	return out
 }
 
 func solCommand() *cli.Command {

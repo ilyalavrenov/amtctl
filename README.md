@@ -1,7 +1,8 @@
 # amtctl
 
 Out-of-band control for Intel AMT (vPro) machines: power state, one-time PXE boot
-override, and a serial-over-LAN console. A single static Go binary.
+override, a serial-over-LAN console, and the firmware event log. A single static
+Go binary.
 
 ## Install
 
@@ -20,6 +21,7 @@ amtctl info    --host amt.example.com                  # power state, AMT versio
 amtctl devices --host amt.example.com                  # boot devices this machine reports
 amtctl boot    --host amt.example.com --device pxe     # pxe | hdd | cd, then reset
 amtctl power   --host amt.example.com --state reset    # on | off | reset | cycle
+amtctl log     --host amt.example.com                  # hardware event log, newest record first
 amtctl sol     --host amt.example.com                  # serial console, Ctrl-] to detach
 ```
 

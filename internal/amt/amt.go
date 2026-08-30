@@ -7,6 +7,7 @@ import (
 
 	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman"
 	amtboot "github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/amt/boot"
+	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/amt/messagelog"
 	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/amt/setupandconfiguration"
 	cimboot "github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/cim/boot"
 	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/cim/power"
@@ -268,4 +269,56 @@ func (c *Client) ForceBoot(device cimboot.Source, state power.PowerState) error 
 	}
 
 	return c.ChangePower(state)
+}
+
+// Event is one decoded record of the AMT hardware event log.
+type Event struct {
+	Time        time.Time
+	Severity    string
+	Entity      string
+	Description string
+}
+
+// Events reads the firmware event log, newest record first. The log survives
+// the OS, so it answers why a machine went down.
+func (c *Client) Events() ([]Event, error) {
+	var events []Event
+
+	// AMT ignores PositionToFirstRecord, so the read position goes to GetRecords
+	// directly.
+	position := 1
+
+	for {
+		res, err := c.messages.AMT.MessageLog.GetRecords(position, messagelog.MaxAMTRecords)
+		if err != nil {
+			return nil, fmt.Errorf("read event log: %w", err)
+		}
+
+		records := res.Body.GetRecordsResponse
+
+		if rv := records.ReturnValue; rv != messagelog.GetRecordsReturnValueCompletedWithNoError {
+			// An empty log is a return value, not an empty record array.
+			if rv == messagelog.GetRecordsReturnValueNoRecordExistsInLog {
+				return events, nil
+			}
+
+			return nil, fmt.Errorf("read event log: %s", rv)
+		}
+
+		for _, record := range records.RefinedEventData {
+			events = append(events, Event{
+				Time:        record.TimeStamp,
+				Severity:    record.EventSeverity,
+				Entity:      record.Entity,
+				Description: record.Description,
+			})
+		}
+
+		// The empty page also stops a device that never sets NoMoreRecords.
+		if records.NoMoreRecords || len(records.RefinedEventData) == 0 {
+			return events, nil
+		}
+
+		position += len(records.RefinedEventData)
+	}
 }

@@ -1,6 +1,8 @@
 package amt
 
 import (
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/xml"
 	"io"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman"
 	cimboot "github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/cim/boot"
@@ -26,10 +29,16 @@ type device struct {
 	// reject names one call to answer with an error instead of a result.
 	reject string
 	sparse bool
+	// logPages are the GetRecords replies, one page per call; the read ends at
+	// the last page.
+	logPages [][]string
+	// logReturn is the ReturnValue answered to GetRecords.
+	logReturn int
 
-	mu     sync.Mutex
-	calls  []string
-	bodies map[string]string
+	mu      sync.Mutex
+	calls   []string
+	bodies  map[string]string
+	logPage int
 }
 
 // serve starts the device and returns a client wired to it.
@@ -130,12 +139,40 @@ func (d *device) answer(call string) (string, bool) {
 		}
 
 		return envelope("<PullResponse><Items>" + items + "</Items></PullResponse>"), true
+	case "AMT_MessageLog.GetRecords":
+		return d.getRecords(), true
 	case "CIM_PowerManagementService.RequestPowerStateChange":
 		return envelope("<RequestPowerStateChange_OUTPUT><ReturnValue>" +
 			strconv.Itoa(d.powerReturn) + "</ReturnValue></RequestPowerStateChange_OUTPUT>"), true
 	default:
 		return "", false
 	}
+}
+
+// getRecords hands out one page per call, so a paged read is observable.
+func (d *device) getRecords() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var page []string
+
+	if d.logPage < len(d.logPages) {
+		page = d.logPages[d.logPage]
+		d.logPage++
+	}
+
+	var body strings.Builder
+
+	body.WriteString("<GetRecords_OUTPUT>")
+
+	for _, record := range page {
+		body.WriteString("<RecordArray>" + record + "</RecordArray>")
+	}
+
+	return envelope(body.String() +
+		"<NoMoreRecords>" + strconv.FormatBool(d.logPage >= len(d.logPages)) + "</NoMoreRecords>" +
+		"<ReturnValue>" + strconv.Itoa(d.logReturn) + "</ReturnValue>" +
+		"</GetRecords_OUTPUT>")
 }
 
 // recorded lists the calls made, in order.
@@ -313,4 +350,113 @@ func TestParseDeviceRejectsUnknown(t *testing.T) {
 
 	_, err := ParseDevice("floppy")
 	require.ErrorContains(t, err, "unknown boot device")
+}
+
+// eventRecord is the 21-byte record AMT stores per event. Only the fields the
+// library decodes are set.
+type eventRecord struct {
+	timestamp  uint32
+	sensorType uint8
+	offset     uint8
+	severity   uint8
+	entity     uint8
+	data       []uint8
+}
+
+func (e eventRecord) encode() string {
+	raw := make([]byte, 21)
+	binary.LittleEndian.PutUint32(raw, e.timestamp)
+	raw[5] = e.sensorType
+	raw[7] = e.offset
+	raw[9] = e.severity
+	raw[11] = e.entity
+	copy(raw[13:], e.data)
+
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func TestEvents(t *testing.T) {
+	t.Parallel()
+
+	d := &device{logPages: [][]string{{
+		eventRecord{timestamp: 1700000000, sensorType: 6, severity: 16, entity: 38, data: []uint8{0xaa, 10, 0}}.encode(),
+		eventRecord{timestamp: 1700000060, sensorType: 15, severity: 16, entity: 34, data: []uint8{0, 8}}.encode(),
+		eventRecord{timestamp: 1700000120, sensorType: 18, severity: 8, entity: 33, data: []uint8{0xaa, 1, 2, 3, 4, 5, 6, 8}}.encode(),
+		eventRecord{timestamp: 1700000180, sensorType: 1, severity: 16, entity: 3}.encode(),
+	}}}
+	c := d.serve(t)
+
+	got, err := c.Events()
+	require.NoError(t, err)
+
+	// The last record is a sensor type the library has no text for; it still has
+	// to reach the caller, since severity and entity carry the diagnosis.
+	assert.Equal(t, []Event{
+		{
+			Time:        time.Unix(1700000000, 0),
+			Severity:    "Critical condition",
+			Entity:      "Intel(r) ME",
+			Description: "Authentication failed 10 times. The system may be under attack.",
+		},
+		{
+			Time:        time.Unix(1700000060, 0),
+			Severity:    "Critical condition",
+			Entity:      "BIOS",
+			Description: "Removable boot media not found.",
+		},
+		{
+			Time:        time.Unix(1700000120, 0),
+			Severity:    "Non-critical condition",
+			Entity:      "System management software",
+			Description: "Agent watchdog 4321-65-... changed to Expired",
+		},
+		{
+			Time:        time.Unix(1700000180, 0),
+			Severity:    "Critical condition",
+			Entity:      "Processor",
+			Description: "Unknown Sensor Type #1",
+		},
+	}, got)
+
+	assert.Equal(t, []string{"AMT_MessageLog.GetRecords"}, d.recorded())
+}
+
+func TestEventsReadsEveryPage(t *testing.T) {
+	t.Parallel()
+
+	record := eventRecord{timestamp: 1700000000, sensorType: 30, severity: 16, entity: 34}.encode()
+	d := &device{logPages: [][]string{{record, record}, {record}}}
+	c := d.serve(t)
+
+	got, err := c.Events()
+	require.NoError(t, err)
+
+	assert.Len(t, got, 3)
+	assert.Equal(t, []string{"AMT_MessageLog.GetRecords", "AMT_MessageLog.GetRecords"}, d.recorded())
+	// body keeps the last call: the second read resumes past the two records the
+	// first one returned.
+	assert.Contains(t, d.body("AMT_MessageLog.GetRecords"), "<h:IterationIdentifier>3</h:IterationIdentifier>")
+}
+
+// AMT reports an empty log as a return value, with no record array at all.
+func TestEventsReadsAnEmptyLog(t *testing.T) {
+	t.Parallel()
+
+	d := &device{logReturn: 3}
+	c := d.serve(t)
+
+	got, err := c.Events()
+	require.NoError(t, err)
+	assert.Empty(t, got)
+	assert.Equal(t, []string{"AMT_MessageLog.GetRecords"}, d.recorded())
+}
+
+func TestEventsReportsARefusedRead(t *testing.T) {
+	t.Parallel()
+
+	d := &device{logReturn: 1}
+	c := d.serve(t)
+
+	_, err := c.Events()
+	require.ErrorContains(t, err, "NotSupported")
 }
