@@ -7,6 +7,7 @@ import (
 
 	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman"
 	amtboot "github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/amt/boot"
+	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/amt/setupandconfiguration"
 	cimboot "github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/cim/boot"
 	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/cim/power"
 	"github.com/device-management-toolkit/go-wsman-messages/v2/pkg/wsman/client"
@@ -17,6 +18,8 @@ const bootConfig0 = "Intel(r) AMT: Boot Configuration 0"
 
 // isNextSingleUse is the CIM_BootService role for a single boot.
 const isNextSingleUse = 1
+
+const amtFirmware = "AMT"
 
 const requestTimeout = 30 * time.Second
 
@@ -101,6 +104,84 @@ func (c *Client) FetchPowerState() (string, error) {
 	}
 
 	return res.Body.AssociatedPowerManagementService.PowerState.String(), nil
+}
+
+// Info is what a device reports about itself; unreported fields stay empty.
+type Info struct {
+	Power        string
+	Version      string
+	Provisioning string
+	ControlMode  string
+}
+
+func (c *Client) FetchInfo() (Info, error) {
+	state, err := c.FetchPowerState()
+	if err != nil {
+		return Info{}, err
+	}
+
+	version, err := c.fetchVersion()
+	if err != nil {
+		return Info{}, err
+	}
+
+	res, err := c.messages.AMT.SetupAndConfigurationService.Get()
+	if err != nil {
+		return Info{}, fmt.Errorf("read setup and configuration: %w", err)
+	}
+
+	setup := res.Body.GetResponse
+
+	return Info{
+		Power:        state,
+		Version:      version,
+		Provisioning: provisioning(setup.ProvisioningState),
+		ControlMode:  controlMode(setup.ProvisioningMode),
+	}, nil
+}
+
+func (c *Client) fetchVersion() (string, error) {
+	enumerated, err := c.messages.CIM.SoftwareIdentity.Enumerate()
+	if err != nil {
+		return "", fmt.Errorf("enumerate software identities: %w", err)
+	}
+
+	pulled, err := c.messages.CIM.SoftwareIdentity.Pull(enumerated.Body.EnumerateResponse.EnumerationContext)
+	if err != nil {
+		return "", fmt.Errorf("read software identities: %w", err)
+	}
+
+	for _, item := range pulled.Body.PullResponse.SoftwareIdentityItems {
+		if item.InstanceID == amtFirmware {
+			return item.VersionString, nil
+		}
+	}
+
+	return "", nil
+}
+
+func provisioning(state setupandconfiguration.ProvisioningStateValue) string {
+	switch state {
+	case setupandconfiguration.PreProvisioning:
+		return "Pre"
+	case setupandconfiguration.InProvisioning:
+		return "In"
+	case setupandconfiguration.PostProvisioning:
+		return "Post"
+	}
+
+	return ""
+}
+
+func controlMode(mode setupandconfiguration.ProvisioningModeValue) string {
+	switch mode {
+	case setupandconfiguration.AdminControlMode:
+		return "Admin"
+	case setupandconfiguration.ClientControlMode:
+		return "Client"
+	}
+
+	return ""
 }
 
 // Devices lists the machine's boot sources: ParseDevice names where known, raw

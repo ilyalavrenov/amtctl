@@ -16,7 +16,7 @@ Or download a binary from the [releases page](https://github.com/ilyalavrenov/am
 ```bash
 export AMT_USER=admin AMT_PASS=...
 
-amtctl info    --host amt.example.com                  # current power state
+amtctl info    --host amt.example.com                  # power state, AMT version, provisioning
 amtctl devices --host amt.example.com                  # boot devices this machine reports
 amtctl boot    --host amt.example.com --device pxe     # pxe | hdd | cd, then reset
 amtctl power   --host amt.example.com --state reset    # on | off | reset | cycle

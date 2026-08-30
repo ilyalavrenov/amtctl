@@ -25,6 +25,7 @@ type device struct {
 	powerReturn int
 	// reject names one call to answer with an error instead of a result.
 	reject string
+	sparse bool
 
 	mu     sync.Mutex
 	calls  []string
@@ -109,6 +110,26 @@ func (d *device) answer(call string) (string, bool) {
 			sourceItem("Intel(r) AMT: Force Hard-drive Boot") +
 			sourceItem("Intel(r) AMT: Force OCR UEFI HTTPS Boot") +
 			"</Items></PullResponse>"), true
+	case "CIM_AssociatedPowerManagementService.Get":
+		return envelope("<CIM_AssociatedPowerManagementService><PowerState>2</PowerState>" +
+			"</CIM_AssociatedPowerManagementService>"), true
+	case "AMT_SetupAndConfigurationService.Get":
+		mode := "<ProvisioningMode>1</ProvisioningMode>"
+		if d.sparse {
+			mode = ""
+		}
+
+		return envelope("<AMT_SetupAndConfigurationService><ProvisioningState>2</ProvisioningState>" +
+			mode + "</AMT_SetupAndConfigurationService>"), true
+	case "CIM_SoftwareIdentity.Enumerate":
+		return envelope("<EnumerateResponse><EnumerationContext>ctx</EnumerationContext></EnumerateResponse>"), true
+	case "CIM_SoftwareIdentity.Pull":
+		items := identityItem("Flash", "16.1.25") + identityItem("AMT", "16.1.30")
+		if d.sparse {
+			items = identityItem("Flash", "16.1.25")
+		}
+
+		return envelope("<PullResponse><Items>" + items + "</Items></PullResponse>"), true
 	case "CIM_PowerManagementService.RequestPowerStateChange":
 		return envelope("<RequestPowerStateChange_OUTPUT><ReturnValue>" +
 			strconv.Itoa(d.powerReturn) + "</ReturnValue></RequestPowerStateChange_OUTPUT>"), true
@@ -130,6 +151,11 @@ func (d *device) body(call string) string {
 	defer d.mu.Unlock()
 
 	return d.bodies[call]
+}
+
+func identityItem(instanceID, version string) string {
+	return "<CIM_SoftwareIdentity><InstanceID>" + instanceID + "</InstanceID>" +
+		"<VersionString>" + version + "</VersionString></CIM_SoftwareIdentity>"
 }
 
 func sourceItem(instanceID string) string {
@@ -233,6 +259,53 @@ func TestDevices(t *testing.T) {
 	// Known sources come back as the --device values; the rest stay raw.
 	assert.Equal(t, []string{"pxe", "hdd", "Intel(r) AMT: Force OCR UEFI HTTPS Boot"}, got)
 	assert.Equal(t, []string{"CIM_BootSourceSetting.Enumerate", "CIM_BootSourceSetting.Pull"}, d.recorded())
+}
+
+func TestFetchInfo(t *testing.T) {
+	t.Parallel()
+
+	d := &device{}
+	c := d.serve(t)
+
+	got, err := c.FetchInfo()
+	require.NoError(t, err)
+
+	assert.Equal(t, Info{
+		Power:        "On",
+		Version:      "16.1.30",
+		Provisioning: "Post",
+		ControlMode:  "Admin",
+	}, got)
+
+	assert.Equal(t, []string{
+		"CIM_AssociatedPowerManagementService.Get",
+		"CIM_SoftwareIdentity.Enumerate",
+		"CIM_SoftwareIdentity.Pull",
+		"AMT_SetupAndConfigurationService.Get",
+	}, d.recorded())
+}
+
+// An unreported field must come back empty, not the enum's zero value.
+func TestFetchInfoLeavesUnreportedFieldsEmpty(t *testing.T) {
+	t.Parallel()
+
+	d := &device{sparse: true}
+	c := d.serve(t)
+
+	got, err := c.FetchInfo()
+	require.NoError(t, err)
+
+	assert.Equal(t, Info{Power: "On", Provisioning: "Post"}, got)
+}
+
+func TestFetchInfoFailsOnARefusedCall(t *testing.T) {
+	t.Parallel()
+
+	d := &device{reject: "CIM_SoftwareIdentity.Pull"}
+	c := d.serve(t)
+
+	_, err := c.FetchInfo()
+	require.ErrorContains(t, err, "read software identities")
 }
 
 func TestParseDeviceRejectsUnknown(t *testing.T) {
