@@ -275,7 +275,7 @@ func (c *Client) ForceBoot(ctx context.Context, device Source, state PowerState)
 
 	// Every field left out below stays at its zero value on the wire: media
 	// index 0 is the first device of the chosen type, and a boot source rules
-	// out the BIOS-screen, IDER and erase options.
+	// out the BIOS-screen, IDER and erase options. AMT 12 rejects UseSOL.
 	req := bootSettingData{
 		H:                    bootSettingDataResource,
 		InstanceID:           settings.InstanceID,
@@ -291,8 +291,6 @@ func (c *Client) ForceBoot(ctx context.Context, device Source, state PowerState)
 		UserPasswordBypass:   settings.UserPasswordBypass,
 		UseSafeMode:          settings.UseSafeMode,
 		EnforceSecureBoot:    settings.EnforceSecureBoot,
-		// Serial console during the forced boot, matching console=ttyS0 kargs.
-		UseSOL: true,
 	}
 
 	if err := c.post(ctx, putAction, bootSettingDataResource, req, nil); err != nil {

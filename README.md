@@ -33,8 +33,7 @@ certificate is self-signed and is **not** verified.
 
 `--json` prints output as JSON.
 
-`boot` enables serial-over-LAN for the boot it stages, so `amtctl sol` shows that
-boot. The console stays silent unless the target's kernel logs to one. `devices`
+`sol` stays silent unless the target's kernel logs to the serial console. `devices`
 lists what the machine actually offers.
 
 ## License
