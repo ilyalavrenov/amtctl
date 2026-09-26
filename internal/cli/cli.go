@@ -211,8 +211,6 @@ func bootCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "boot",
 		Usage: "force a one-time boot from a device, then apply the power action",
-		Description: "Stages the boot override and enables serial-over-LAN for the next boot, " +
-			"so `amtctl sol` shows the boot it triggers.",
 		Flags: append(connectionFlags(), &cli.StringFlag{
 			Name:  flagDevice,
 			Value: "pxe",

@@ -233,7 +233,6 @@ func TestForceBoot(t *testing.T) {
 		InstanceID:   "Intel(r) AMT:BootSettingData 0",
 		ElementName:  "Boot Configuration",
 		LockKeyboard: true,
-		UseSOL:       true,
 	}, got)
 
 	assert.Contains(t, d.body("CIM_BootConfigSetting.ChangeBootOrder"), string(hardDrive))
