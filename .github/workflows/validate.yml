@@ -43,7 +43,7 @@ jobs:
       - run: go run "golang.org/x/vuln/cmd/govulncheck@${VULN_VERSION}" ./...
         env:
           # renovate: datasource=go depName=golang.org/x/vuln
-          VULN_VERSION: "v1.9.0"
+          VULN_VERSION: "v1.10.0"
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           install-only: true
